@@ -66,7 +66,7 @@ sub getparentdir {
 	my @dir = File::Spec->splitdir($dir);
 	pop @dir;
 	$dir = File::Spec->catdir(@dir);
-	File::Spec::catpath($volume, $dir);
+	File::Spec->catpath($volume, $dir);
 }
 sub slurp {
 	my $fn = shift;
@@ -196,8 +196,8 @@ sub mkreq {
 	my $names = join(',', map { "DNS:$_" } @_);
 	trace "Generating CSR for: $dn ($names) using key $tlskey";
 	my $cnf = File::Temp->new(TEMPLATE => "openssl.cnf-XXXXXX", DIR => $config_dir);
-	print $cnf "prompt=no\ndistinguish_name=dn\n[dn]\nCN=$dn\n";
-	print $cnf "req_extensions=reqexts\n[reqexts]\nsubjectAltName=$names\n";
+	print $cnf "prompt=no\ndistinguished_name=dn\nreq_extensions=reqexts\n[dn]\nCN=$dn\n";
+	print $cnf "[reqexts]\nsubjectAltName=$names\n";
 	$cnf->flush;
 	my $req = openssl(undef, 'req',
 		'-new',
@@ -532,12 +532,13 @@ my %ops; %ops = (
 				-outform => 'der',
 			);
 			die "cert: couldn't convert CSR to DER format" if $exit;
+			$csr = encode_base64url($csr);
 		} else {
 			pod2usage("cert: need list of domains") unless @domains;
-			$csr = mkreq(slurp($key), @domains);
+			$csr = mkreq($key, @domains);
 		}
 		my $res = acme_new('new-cert',
-			csr => encode_base64url($csr),
+			csr => $csr,
 		);
 		if ($res->code eq '201') {
 			$res = openssl($res->decoded_content, 'x509',
