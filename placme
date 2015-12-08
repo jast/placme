@@ -66,7 +66,7 @@ sub getparentdir {
 	my @dir = File::Spec->splitdir($dir);
 	pop @dir;
 	$dir = File::Spec->catdir(@dir);
-	File::Spec::catpath($volume, $dir);
+	File::Spec->catpath($volume, $dir);
 }
 sub slurp {
 	my $fn = shift;
