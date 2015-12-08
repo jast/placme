@@ -1,0 +1,896 @@
+#!/usr/bin/perl
+
+# placme - Perl client for the ACME protocol (used by e.g. Let's Encrypt)
+# Copyright 2015 Jan Krüger
+# License: GPL v3 or newer (you choose)
+
+use 5.12.0;
+our $VERSION = '0.1';
+
+use autodie;
+use strict;
+use warnings;
+
+use Digest::SHA;
+use File::Path qw(make_path);
+use File::Spec;
+use File::Temp;
+use Getopt::Long;
+use IPC::Open2;
+use JSON;
+use LWP::UserAgent;
+use MIME::Base64 qw(encode_base64url decode_base64url);
+use Pod::Usage;
+
+my $config_dir = File::Spec->catdir($ENV{HOME}, '.config', 'placme');
+my $directory;
+my $quiet;
+my $verbose;
+my $trace;
+my $keyfile;
+my %resources;
+my @nonces;
+
+my $ua = LWP::UserAgent->new;
+$ua->agent("placme/$VERSION ");
+$ua->protocols_allowed(['https']);
+
+# Helpers {{{
+sub out($) {
+	print STDERR shift."\n";
+}
+sub noise($) {
+	out shift unless $quiet;
+}
+sub info($) {
+	out shift if $verbose || $trace;
+}
+sub trace($) {
+	out shift if $trace;
+}
+sub which {
+	my @path = File::Spec->path;
+	my $bin = shift;
+	while (my $p = shift @path) {
+		my $candidate = File::Spec->catfile($p, $bin);
+		return $candidate if -x $candidate;
+	}
+	return;
+}
+sub getdir {
+	my ($volume, $dir, $file) = File::Spec->splitpath(@_);
+	File::Spec->catpath($volume, $dir, '');
+}
+sub getparentdir {
+	my ($volume, $dir, $file) = File::Spec->splitpath(shift);
+	my @dir = File::Spec->splitdir($dir);
+	pop @dir;
+	$dir = File::Spec->catdir(@dir);
+	File::Spec::catpath($volume, $dir);
+}
+sub slurp {
+	my $fn = shift;
+	my $chompy = shift;
+	local $/;
+	open(my $fh, '<', $fn);
+	my $res = <$fh>;
+	chomp $res if $chompy;
+	$res;
+}
+sub spurt {
+	my $fn = shift;
+	open(my $fh, '>', $fn);
+	print $fh shift;
+}
+sub cfgfile {
+	File::Spec->catfile($config_dir, shift);
+}
+sub cfgslurp {
+	my $fn = shift;
+	slurp(cfgfile($fn), @_);
+}
+sub cfgspurt {
+	my $fn = shift;
+	spurt(cfgfile($fn), shift);
+}
+my $exit;
+sub tick {
+	sys2(undef, @_);
+}
+sub sys2 {
+	my $data = shift;
+	trace "Execute: ". to_json(\@_);
+	my ($out, $in);
+	my $pid = open2($out, $in, @_);
+	print $in $data if defined $data;
+	close $in;
+	local $/;
+	my $res = <$out>;
+	waitpid $pid, 0;
+	$exit = $?;
+	die sprintf("I ran %s but it died from signal %d%s",
+		$_[0],
+		$exit & 127,
+		$exit & 128 ? ' (core dumped)' : ''
+	) if $exit & 127;
+	$exit >>= 8;
+	$res;
+}
+sub openssl {
+	my $bin = which('openssl') // die "openssl binary not found in PATH";
+	sys2(shift, $bin, @_);
+}
+# }}}
+# Crypto and JWS fun {{{
+my $jwk_cached;
+sub jwk {
+	return $jwk_cached if defined $jwk_cached;
+	my $text = openssl(undef, 'pkey',
+		'-noout',
+		'-text_pub',
+		'-in' => $keyfile,
+	);
+	die "failed extracting JWK parameters from account key" if $exit;
+	die "failed extracting modulus from account key" unless $text =~ m!^Modulus:([\s0-9a-f:]+)!ms;
+	my $modulus = $1;
+	{
+		use bytes;
+		$modulus =~ s#[^0-9a-f]##g;
+		$modulus = pack("H*", $modulus);
+		$modulus =~ s!^\x00*!!;
+	}
+	die "failed extracting exponent from account key" unless $text =~ m!^Exponent: (\d+)!m;
+	my $exponent = $1;
+	$exponent = pack("N", $exponent);
+	$exponent =~ s!^\x00*!!;
+	$jwk_cached = {
+		kty => 'RSA',
+		n => encode_base64url($modulus),
+		e => encode_base64url($exponent),
+	};
+	$jwk_cached;
+}
+sub jwk_thumbprint {
+	my $jwk = jwk();
+	my $json = JSON->new->canonical->encode($jwk);
+	encode_base64url(Digest::SHA::sha256($json));
+}
+sub sign {
+	my $data = shift;
+	my $hash = openssl($data, 'dgst',
+		-sign => $keyfile,
+		'-sha256',
+		'-binary',
+	);
+	die "failed signing ACME protocol message" if $exit;
+	encode_base64url($hash);
+}
+sub _jws_flattened {
+	my $header = shift;
+	my %payload = @_;
+	$header->{alg} = 'RS256';
+	$header->{jwk} = jwk();
+	my $prot_header_enc = encode_base64url(encode_json($header));
+	my $payload = encode_json(\%payload);
+	trace "Generate signed message: $payload, header: ". encode_json($header);
+	my $payload_enc = encode_base64url($payload);
+	my $signature = sign("$prot_header_enc.$payload_enc");
+	my $res = encode_json({
+		payload => $payload_enc,
+		protected => $prot_header_enc,
+		signature => $signature,
+	});
+	$res;
+}
+sub jws_nonce {
+	_jws_flattened({
+		nonce => shift @nonces,
+	}, @_);
+}
+sub jws_flattened {
+	_jws_flattened({}, @_);
+}
+sub mkreq {
+	my $tlskey = shift;
+	my $dn = $_[0];
+	my $names = join(',', map { "DNS:$_" } @_);
+	trace "Generating CSR for: $dn ($names) using key $tlskey";
+	my $cnf = File::Temp->new(TEMPLATE => "openssl.cnf-XXXXXX", DIR => $config_dir);
+	print $cnf "prompt=no\ndistinguish_name=dn\n[dn]\nCN=$dn\n";
+	print $cnf "req_extensions=reqexts\n[reqexts]\nsubjectAltName=$names\n";
+	$cnf->flush;
+	my $req = openssl(undef, 'req',
+		'-new',
+		-key => $tlskey,
+		-config => $cnf->filename,
+		-outform => 'der',
+	);
+	die "failed to create certificate request" if $exit;
+	encode_base64url($req);
+}
+# }}}
+# ACME protocol {{{
+sub _process_nonce {
+	my $nonce = shift;
+	return unless defined $nonce;
+	trace "Received nonce: $nonce";
+	die "invalid nonce from server" if $nonce =~ /[^0-9A-Za-z_-]/;
+	return if grep $nonce, @nonces;
+	push @nonces, $nonce;
+}
+sub _acme_response {
+	my $res = shift;
+	_process_nonce($res->header('replay-nonce'));
+
+	trace "HTTP Response ------------------------------------\n". $res->as_string .
+		"--------------------------------------------------";
+	if ($res->is_error) {
+		out "Error from server: ". $res->status_line;
+		exit(1) if (($res->header('client-warning') // '') eq 'Internal response');
+		my $err = decode_json($res->decoded_content);
+		out "Error details: ". $err->{detail};
+		exit(1);
+	}
+	$res;
+}
+sub _acme_plain {
+	my $url = shift;
+	trace "Fetching info from: $url";
+	my $res = $ua->get($url);
+	_acme_response($res);
+}
+sub _acme {
+	my $url = shift;
+
+	unless (@nonces) {
+		trace "Requesting new nonce by retrieving directory";
+		_acme_plain($directory);
+	}
+
+	my $msg = jws_nonce(@_);
+	trace "Sending to: $url";
+	my $res = $ua->post($url, Content => $msg);
+	_acme_response($res);
+}
+sub _acme_link {
+	my ($res, $type) = @_;
+	my @links = $res->header('link');
+	my ($link) = grep /;rel="\Q$type\E"/, @links;
+	return unless $link;
+	$link =~ m#^<(https://.*?)>#;
+	die "Error: could not parse link of type '$type'" unless $1;
+	$1;
+}
+sub acme {
+	my $url = shift;
+	return _acme($url, @_) if @_;
+	_acme_plain($url);
+}
+sub acme_directory {
+	info "Fetching directory";
+	my $res = acme($directory);
+	%resources = %{decode_json($res->decoded_content)};
+}
+sub acme_new {
+	my $resource = shift;
+	acme_directory() unless exists $resources{$resource};
+	die "unknown ACME resource: $resource" unless exists $resources{$resource};
+
+	acme($resources{$resource}, resource => $resource, @_);
+}
+# }}}
+
+Getopt::Long::Configure('bundling', 'require_order', 'pass_through');
+# General options
+GetOptions(
+	'config|c=s'	=> \$config_dir,
+	'verbose|v!'	=> \$verbose,
+	'trace|t!'	=> \$trace,
+	'version'	=> sub { out "placme version $VERSION"; exit; },
+);
+
+$keyfile = File::Spec->catfile($config_dir, 'account_key.pem');
+if (-f cfgfile('directory')) {
+	$directory = cfgslurp('directory');
+} else {
+	$directory = 'https://acme-v01.api.letsencrypt.org/directory';
+}
+$ua->show_progress(1) if $verbose;
+
+my %ops; %ops = (
+	help => sub { #{{{
+		pod2usage(-exitval => 0, -verbose => 1,
+			-message => "Showing summary, use help --full for more."
+		) if (!@ARGV);
+		pod2usage(-exitval => 0, -verbose => 2) if $ARGV[0] eq '--full';
+		pod2usage(-exitval => 0, -verbose => 99, -sections => "OPERATIONS/$ARGV[0]");
+	}, # }}}
+	bootstrap => sub { #{{{
+		$ops{initconf}->();
+		$ops{mkkey}->();
+		$ops{reg}->();
+		exit;
+	}, #}}}
+	initconf => sub { #{{{
+		GetOptions(
+			'directory|d=s' => \$directory,
+		);
+		if (!-d $config_dir) {
+			my $parent = getparentdir($config_dir);
+			make_path($parent);
+			make_path($config_dir, { mode => 0700 });
+			noise "Created config dir: $config_dir";
+		}
+		if ($directory) {
+			cfgspurt('directory', $directory);
+		}
+	}, #}}}
+	mkkey => sub { #{{{
+		my $bits = 2048;
+		GetOptions(
+			'bits|b=i' => \$bits,
+		);
+		-f $keyfile && die "mkkey: account_key.pem already exists";
+		openssl(undef, 'genpkey',
+			-algorithm => 'RSA',
+			-out => $keyfile,
+			-pkeyopt => "rsa_keygen_bits:$bits"
+		);
+		die "mkkey: generation failed" if $exit;
+		out "mkkey: created key.";
+	}, #}}}
+	reg => sub { #{{{
+		if (-f cfgfile('registration')) {
+			out "Registration already exists, aborting";
+			exit(1);
+		}
+		my (@contacts, $autoagree);
+		GetOptions(
+			'autoagree!' => \$autoagree,
+			'contact=s' => \@contacts,
+		);
+		pod2usage("reg: no contact(s) given") unless @contacts;
+		my $res = acme_new('new-reg',
+			contact => \@contacts,
+		);
+		if ($res->code eq '201') {
+			noise "Registration successful.";
+			cfgspurt('registration', $res->header('location'));
+			my $tos = _acme_link($res, 'terms-of-service');
+			if ($tos) {
+				if ($autoagree) {
+					info "Automatically agreeing to TOS (tsk, tsk)";
+					@ARGV = ("--agreement=$tos");
+					$ops{updatereg}->();
+					exit;
+				}
+				noise "Depending on the server's policies, you may need to agree to the TOS";
+				noise "by running: placme updatereg --agreement=<TOS URL>.";
+				noise "Terms of service URL: $tos";
+			}
+			print(($tos || '') ."\n");
+			print $res->decoded_content;
+		}
+	}, #}}}
+	updatereg => sub { #{{{
+		my $reg = cfgslurp('registration');
+		my ($agreement, @contacts);
+		GetOptions(
+			'agreement=s' => \$agreement,
+			'contact=s' => \@contacts,
+		);
+		my %payload;
+		$payload{agreement} = $agreement if $agreement;
+		$payload{contact} = \@contacts if @contacts;
+		my $res = acme($reg,
+			resource => 'reg',
+			%payload,
+		);
+		unless ($res->code eq '202') {
+			die "updatereg: unexpected status code, full response follows:\n". $res->as_string;
+		}
+		my $data = decode_json($res->decoded_content);
+		my $tos = _acme_link($res, 'terms-of-service');
+		if ($tos && (!$data->{agreement} || $data->{agreement} ne $tos)) {
+			out "URL for terms of service which you have not accepted yet: $tos";
+			out "Use updatereg --agreement=<URL> to confirm agreement.";
+		}
+		print(($tos || '') ."\n");
+		print $res->decoded_content;
+	}, #}}}
+	authz => sub { #{{{
+		my ($auto_http, $domain);
+		GetOptions(
+			'http|h:s' => \$auto_http,
+			'domain|d=s' => \$domain,
+		);
+		pod2usage("authz: need domain parameter") unless $domain;
+		my $res = acme_new('new-authz',
+			identifier => {
+				type => 'dns',
+				value => $domain,
+			},
+		);
+		die "authz: unexpected status code from server (".$res->code.")" unless $res->code eq '201';
+		noise "Authorization is now pending.";
+		unless (defined $auto_http) {
+			print "uri ". $res->header('location') ."\n";
+			print "data ". $res->decoded_content;
+			exit;
+		}
+		my $authz = decode_json($res->decoded_content);
+		unless ($authz->{status} eq 'pending') {
+			out "authz: authorization response from server is not marked as pending.";
+			out "Please manually review the response:";
+			out $res->decoded_content;
+			exit(1);
+		}
+		my ($ch_http) = grep { $_->{type} eq 'http-01' } @{$authz->{challenges}};
+		unless ($ch_http) {
+			out "authz: no HTTP challenge found in authorization response";
+			out "Please manually review the response:";
+			out $res->decoded_content;
+			exit(1);
+		}
+		unshift(@ARGV,
+			"--token=$ch_http->{token}",
+			"--type=$ch_http->{type}",
+		);
+		unshift(@ARGV,
+			"--url=$ch_http->{uri}",
+		) if $auto_http eq 'send';
+		print "token $ch_http->{token}\n";
+		print "uri $ch_http->{uri}\n";
+		$ops{confirm}->();
+	}, #}}}
+	confirm => sub { #{{{
+		my ($url, $token, $wait, $in, $send, $skip_keyauth, $keyauth_out);
+		my $type = 'http-01';
+		GetOptions(
+			'url|u=s' => \$url,
+			'type|T=s' => \$type,
+			'token|t=s' => \$token,
+			'skip-keyauth|K' => \$skip_keyauth,
+			'keyauth-out=s' => \$keyauth_out,
+			'wait|w=i' => \$wait,
+		);
+		pod2usage("confirm: requires --token=...") unless $token;
+
+		my $thumb = jwk_thumbprint();
+		unless ($skip_keyauth) {
+			if (!$keyauth_out && $type eq 'http-01') {
+				noise "Put the key authorization string in a file in the web root for your domain";
+				noise "using the following name:";
+				noise ".well-known/acme-challenge/$token";
+			}
+			if ($keyauth_out) {
+				$keyauth_out =~ s!:TOKEN:!$token!g;
+				spurt($keyauth_out, "$token.$thumb");
+			} else {
+				print "keyauth $token.$thumb\n";
+			}
+			exit unless $url;
+		}
+		pod2usage("confirm: need --url=...") unless $url;
+
+		my $res = acme($url,
+			resource => 'challenge',
+			type => $type,
+			keyAuthorization => "$token.$thumb",
+		);
+		my $authz_url = _acme_link($res, 'up');
+		print "uri ". $res->header('location') ."\n";
+		my $first_try = time;
+		my $checkauthz; $checkauthz = sub {
+			if ($res->code eq '200') {
+				print "data ". $res->decoded_content ."\n";
+				my $authz = decode_json($res->decoded_content);
+				exit if $authz->{status} eq 'active';
+				exit(1);
+			} elsif ($res->code eq '202') {
+				if (time - $first_try > $wait) {
+					out "Wait timeout exceeded, please check manually later.";
+					exit(1);
+				}
+				my $delay = $res->header('retry-after') || 5;
+				info "Waiting $wait seconds to re-check...";
+				sleep($delay);
+				$res = acme($authz_url);
+				$checkauthz->();
+			} else {
+				die "confirm: unexpected result from server: ".$res->decoded_content;
+			}
+		};
+		if ($wait) {
+			$checkauthz->();
+		} else {
+			print "uri $authz_url\n";
+			print "data ". $res->decoded_content;
+		}
+	}, #}}}
+	cert => sub { #{{{
+		my ($csr, $key, $out);
+		GetOptions(
+			'csr|c:s' => \$csr,
+			'key|k=s' => \$key,
+			'out|o=s' => \$out,
+		);
+		my @domains = @ARGV;
+		pod2usage("cert: need --csr or --key") unless defined($csr) || $key;
+		pod2usage("cert: --csr and --key are mutually exclusive") if $csr && $key;
+		if ($out && (-f $out && !-w $out || !-w getdir($out))) {
+			die "cert: desired output file '$out' seems unwritable";
+		}
+		if (defined $csr) {
+			if ($csr ne '' && $csr ne '-') {
+				$csr = slurp($csr);
+			} else {
+				local $/;
+				$csr = <STDIN>;
+			}
+			$csr = openssl($csr, 'req',
+				-outform => 'der',
+			);
+			die "cert: couldn't convert CSR to DER format" if $exit;
+		} else {
+			pod2usage("cert: need list of domains") unless @domains;
+			$csr = mkreq(slurp($key), @domains);
+		}
+		my $res = acme_new('new-cert',
+			csr => encode_base64url($csr),
+		);
+		if ($res->code eq '201') {
+			$res = openssl($res->decoded_content, 'x509',
+				-inform => 'der',
+			);
+			die "cert: could not convert certificate to PEM" if $exit;
+			if ($out) {
+				spurt($out, $res);
+			} else {
+				print $res;
+			}
+		} else {
+			out "cert: certificate request accepted but certificate not ready yet.";
+			out "This case is not currently supported by placme.";
+			out "Please fetch the certificate yourself at this location after ~". $res->header('retry-after') ." seconds:";
+			out $res->header('location');
+			exit(1);
+		}
+		if ($out) {
+			spurt($out, $res);
+		} else {
+			print $res;
+		}
+	}, #}}}
+	revoke => sub { #{{{
+		my $in;
+		GetOptions(
+			'in|i=s' => \$in,
+		);
+		if ($in) {
+			$in = slurp($in);
+		} else {
+			local $/;
+			$in = <STDIN>;
+		}
+		$in = openssl($in, 'x509',
+			-outform => 'der',
+		);
+		die "revoke: could not convert certificate to DER" if $exit;
+		my $res = acme_new('revoke-cert',
+			certificate => encode_base64url($in),
+		);
+		if ($res->code eq '200') {
+			noise "Certificate revoked.";
+			exit;
+		}
+		die "revoke: unexpected result from server: ". $res->decoded_content;
+	}, #}}}
+);
+
+my $op = shift @ARGV;
+pod2usage("No operation specified") unless defined $op && $op ne '';
+pod2usage("Unknown operation '$op'") unless exists $ops{$op};
+
+$ops{$op}->();
+exit;
+
+# Manual {{{
+__END__
+
+=head1 NAME
+
+placme - Perl client for the ACME protocol (used by e.g. Let's Encrypt)
+
+=head1 SYNOPSIS
+
+ placme --version
+ placme help [<command>|--full]
+ placme [options] <operation> [<operation options>] 
+ 
+ placme bootstrap --contact=mailto:me@example.org
+ placme updatereg --agreement=...
+ placme authz --http=send --domain=<domain> --wait=30
+     --keyauth-out=/www/<domain>/.well-known/acme-challenge/:TOKEN:
+ placme cert --key=<tls.key> <domain>...
+
+=head1 OPTIONS
+
+These are general options available to all operations, passed before the
+operation name.
+
+=over 4
+
+=item B<--config=..., -c ...>
+
+Sets a path to store configuration and persistent data for an
+account. Defaults to F<~/.config/placme>.
+
+If you want to use multiple accounts, you should use multiple config paths,
+too.
+
+=item B<--trace, -t>
+
+Enables trace mode: information about all executed sub-processes and
+protocol messages will be displayed.
+
+=item B<--verbose, -v>
+
+Enables informational output and some progress indicators.
+
+=item B<--version>
+
+Shows the placme version and exits.
+
+=back
+
+=head1 OPERATIONS
+
+=head2 bootstrap
+
+Runs initconf, mkkey, and reg (creates the config path wih a keypair and
+registers an account using that keypair).
+
+It accepts all corresponding options, but they need to be specified in the
+correct order: mkkey first and then reg (initconf has no options).
+
+=head2 initconf
+
+Creates the config path (if it does not already exist).
+
+The config path will be readable only for the current user by default, for
+security reasons (but parents automatically created by C<initconf> will have
+permissions according to your umask). Feel free to change its mode but do so
+at your own risk.
+
+=head3 Options
+
+=over 4
+
+=item B<--directory=..., -d ...>
+
+Sets the URL where the ACME server's resource directory can be queried.
+C<initconf> can be run again later to change this.
+
+If not set, the letsencrypt.org ACME server will be used.
+
+=back
+
+=head2 mkkey
+
+Creates an account keypair in the config path, with the name
+F<account_key.pem>. Only one keypair per config path is supported.
+
+=head3 Options
+
+=over 4
+
+=item B<--bits=...>
+
+The size of the key, defaults to 2048. My personal understanding is that
+smaller values are considered to be somewhat insecure and that the benefit to
+bigger values is not nearly as much as you might think. If you care, look it
+up.
+
+=back
+
+=head2 reg
+
+Registers an account for the keypair in the config path.
+
+=head3 Options
+
+=over 4
+
+=item B<--contact=I<URI>>
+
+Specifies a contact to be associated with the account. It may be given
+multiple times.
+
+This information is typically held private by the ACME server and it's a
+really good idea to specify at least one e-mail address
+(C<mailto:foo@example.org>). For this reason, placme requires at least one
+instance of this option, even if the server does not.
+
+=item B<--autoagree>
+
+Automatically agree to the terms of service. Legally speaking, this is
+probably not a good idea. You can manually agree to the terms of service using
+the C<updatereg> operation.
+
+=back
+
+=head2 updatereg
+
+Update your registration, changing the contacts or confirming your agreement
+to the terms of service.
+
+If you do not include any options that change your registration, placme will
+simply query the full registration data and output it.
+
+=head3 Options
+
+=over 4
+
+=item B<--agreement=...>
+
+Set this to the URL of the server's terms of service (which placme outputs
+when you register, or when you query your registration using C<updatereg>
+without options) to tell the server that you agree with the TOS. The server
+may be rejecting all the interesting operations if you do not send your
+agreement to the TOS first.
+
+=item B<--contact=...>
+
+Just like during registration, you can use this one multiple times. If you use
+it, all the previously registered contacts will be removed, so be sure to list
+all contacts you want to have on your account.
+
+=back
+
+=head2 authz
+
+Requests authorization for a domain. If successful, placme will output the
+authorization URL (for polling its status), followed by a newline and then, in
+JSON format, the server's challenge data that tells you how to demonstrate
+that you should be authorized to request certificates for that domain.
+
+=head3 Options
+
+=over 4
+
+=item B<--domain=I<domain>, -d I<domain>>
+
+The domain you want to get an authorization for.
+
+=item B<--http[=send], -h [send]>
+
+Include this to automatically begin responding to an HTTP-based challenge
+(http-01). This will automatically forward the type, token and challenge URL
+to the C<confirm> command (but the URL will only be included if you include
+the C<=send>). You can pass any of C<confirm>'s options after C<authz>'s
+options, though of course you'll want to leave out C<--type>, C<--token> and
+C<--url>.
+
+=head2 confirm
+
+Prepares (and optionally submits) confirmation of the challenge.
+
+For HTTP (the only option fully supported by placme right now), this involves
+putting a file at a special location with special content. If you have write
+access to the correct location while running placme, you can automatically
+have it put the challenge file there and send confirmation to the server.
+
+If you want to use something other than HTTP, you can still use this operation
+to generate the I<key authorization> string used by most of the challenge
+types in ACME (e.g. TLS SNI and DNS), though you'll have to do the rest of the
+work yourself until ACME adds more support for those.
+
+Once the server has accepted your authorization(s), you can use the C<cert>
+operation to request a certificate for any domains you are authorized for.
+
+=head3 Options
+
+=over 4
+
+=item B<--type=..., -T ...>
+
+The type of challenge to confirm, taken from the corresponding challenge
+record. Defaults to C<http-01>.
+
+=item B<--token=..., -t ...>
+
+The challenge token.
+
+=item B<--url=..., -u ...>
+
+The URL to send confirmation to, as included in the challenge data. If you
+leave this out, confirmation will not be sent to the server. You would leave
+out the URL if you want to generate the key authorization and need to do some
+additional preparation work before you actually let the server know you're
+ready. Simply use C<confirm> again when you're done and pass the URL then.
+
+=item B<--skip-keyauth, -K>
+
+Skip generation of key authorization output. You can use this for a bit less
+noise if you have already fulfilled the challenge and are calling C<confirm>
+for the second time.
+
+=item B<--keyauth-out=..., -o ...>
+
+Where to write the I<key authorization> string to. You can use the special
+placeholder C<:TOKEN:> in this path to have it replaced with the challenge
+token (in case you're sending confirmation at the same time you're generating
+the key authorization), since that is what's required for HTTP-based
+challenges.
+
+=item B<--wait=..., -w ...>
+
+Wait this many seconds for the server to accept the challenge and mark the
+authorization as valid. If you leave this out, you will have to poll the
+authorization URL yourself.
+
+=back
+
+=head2 cert
+
+Requests a certificate for a CSR or a key and list of domains. (The protocol
+allows for certificates for arbitrary IDs, but for the sake of simplicity
+placme uses only domain names (without any pesky protocol-like prefixes).
+
+The list of domains you pass (either via the command line, or via a
+pre-prepared CSR) must have valid authorizations on your account; otherwise
+unhelpful things are likely to happen.
+
+=head3 Options
+
+=over 4
+
+=item B<--key=..., -k ...>
+
+Location of a private key to use as basis for the CSR, in PEM format. If you
+do not use this, use C<--csr=...> instead; see below.
+
+=item B<--csr=..., -c ...>
+
+Use this to pass a pre-generated CSR file (in PEM format) that will be sent to
+the ACME server. If you do not use this, use C<--key=...> instead; see above.
+
+=item B<--out=..., -o ...>
+
+Name of the file placme will write the certificate to (if all goes well). If
+you leave this out, the certificate will be written to C<stdout>.
+
+=item B<I<domain>...>
+
+A list of domain names to be included in the CSR as subjectAltNames. The first
+name in the list will be set as the common name (CN) in the certificate. The
+ACME server may change the list of domain names (and the CN) in the final
+certificate. The server may reject your request or filter names from these
+list if you have no authorization for any of them.
+
+This has no effect if you supply your own CSR.
+
+=back
+
+=head1 LIMITATIONS
+
+placme does not support account recovery keys. Please make sure to keep a
+secure backup copy of your account key.
+
+Some other operations are not supported, either. For example, placme does not
+provide any support of its own for C<tls-sni-01> or C<dns> challenges, beyond
+generating the key authorization string used in these methods.
+
+placme's error handling is trigger-happy: it will often exit with a somewhat
+generic message and a generic exit code. In many of these cases it might be
+possible to provide more details about the error and its causes. If you have
+any suggestions (perhaps even with patches), just let me know.
+
+placme does not do any fancy security things, such as preventing private key
+data from being swapped out of memory. It may be worthwhile running it on a
+more or less isolated system to prevent any catastrophic leakage of sensitive
+data (e.g. your account key).
+
+=cut
+
