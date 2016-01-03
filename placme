@@ -557,11 +557,6 @@ my %ops; %ops = (
 			out $res->header('location');
 			exit(1);
 		}
-		if ($out) {
-			spurt($out, $res);
-		} else {
-			print $res;
-		}
 	}, #}}}
 	revoke => sub { #{{{
 		my $in;
