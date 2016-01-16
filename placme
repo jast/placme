@@ -668,7 +668,7 @@ sub _badresponse {
 	my $msg = shift || "Unexpected response from server";
 	return {
 		res => 0,
-		msg => "$msg\nServer response reproduced below:\n". $res->as_string ."\n------ END ------",
+		msg => "$msg",
 		response => $res,
 	};
 }
@@ -676,9 +676,14 @@ sub _badbail {
 	my $res = shift;
 	return if $res->{res};
 	putdata('error', '%s', $res->{msg});
-	my $resp = {
-		response => $res->{response}->as_string
-	};
+	my $resp;
+	if (($res->{response}->header('client-warning') // '') eq 'Internal response') {
+		$resp = {
+			response => $res->{response}->as_string
+		};
+	} else {
+		$resp = decode_json($res->{response}->decoded_content);
+	}
 	putdata('error-json', 'Error details: %s', $friendlyjson->encode($resp));
 	exit;
 }
@@ -698,7 +703,7 @@ sub reg {
 	my $res = acme_new('new-reg',
 		contact => $opts{contacts},
 	);
-	_badresponse($res) unless $res->code eq '201';
+	return _badresponse($res) unless $res->code eq '201';
 	_goodresponse($res,
 		tos => _acme_link($res, 'terms-of-service'),
 	);
@@ -709,7 +714,7 @@ sub updatereg {
 		resource => 'reg',
 		%opts,
 	);
-	_badresponse($res) unless $res->code eq '202';
+	return _badresponse($res) unless $res->code eq '202';
 	_goodresponse($res,
 		tos => _acme_link($res, 'terms-of-service')
 	);
@@ -722,7 +727,7 @@ sub authz {
 			value => $opts{domain},
 		},
 	);
-	_badresponse($res) unless $res->code eq '201';
+	return _badresponse($res) unless $res->code eq '201';
 	my $obj = decode_json($res->decoded_content);
 	my $ch_http = grep { $_->{type} eq 'http-01' } @{$obj->{challenges}};
 	_goodresponse($res,
@@ -732,7 +737,7 @@ sub authz {
 sub getauthz {
 	my %opts = @_;
 	my $res = acme($opts{url});
-	_badresponse($res) unless $res->code =~ /^20[02]$/;
+	return _badresponse($res) unless $res->code =~ /^20[02]$/;
 	my $obj = decode_json($res->decoded_content);
 	_goodresponse($res,
 		authzurl => _acme_link($res, 'up'),
@@ -748,13 +753,13 @@ sub confirm {
 		type => $opts{type},
 		keyAuthorization => "$opts{token}.$opts{thumb}",
 	);
-	_badresponse($res) unless $res->code =~ /^20[02]$/;
+	return _badresponse($res) unless $res->code =~ /^20[02]$/;
 	my $obj = decode_json($res->decoded_content);
 	_goodresponse($res,
 		authzurl => _acme_link($res, 'up'),
 		code => $res->code,
 		status => $obj->{status},
-		delay => $res->header('retry-after'),
+		delay => $res->header('retry-after') // undef,
 	);
 }
 
@@ -909,7 +914,7 @@ my %ops; %ops = (
 				$keyauth_out =~ s!:TOKEN:!$token!g;
 				spurt($keyauth_out, "$token.$thumb");
 			} else {
-				putdata('keyauth', 'Key authorization string for the challenge: %s', $token.$thumb);
+				putdata('keyauth', 'Key authorization string for the challenge: %s', "$token.$thumb");
 			}
 			exit unless $url;
 		}
