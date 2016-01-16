@@ -11,6 +11,7 @@ use autodie;
 use strict;
 use warnings;
 
+use Carp;
 use Digest::SHA;
 use File::Path qw(make_path);
 use File::Spec;
@@ -19,17 +20,21 @@ use Getopt::Long;
 use IPC::Open2;
 use JSON;
 use LWP::UserAgent;
-use MIME::Base64 qw(encode_base64url decode_base64url);
+use MIME::Base64 qw(encode_base64url decode_base64url encode_base64 decode_base64);
 use Pod::Usage;
+use Time::Piece;
 
 my $config_dir = File::Spec->catdir($ENV{HOME}, '.config', 'placme');
 my $directory;
 my $quiet;
 my $verbose;
 my $trace;
+my $machine;
 my $keyfile;
 my %resources;
 my @nonces;
+
+my $friendlyjson;
 
 my $ua = LWP::UserAgent->new;
 $ua->agent("placme/$VERSION ");
@@ -44,6 +49,21 @@ sub noise($) {
 }
 sub info($) {
 	out shift if $verbose || $trace;
+}
+sub putdata {
+	my $v_only;
+	$v_only = shift if ($_[0] // '') eq '-v';
+
+	my ($type, $msg, $data) = @_;
+	if ($machine) {
+		print "$type $data\n";
+	} else {
+		printf "$msg\n", $data unless $v_only && !$verbose;
+	}
+}
+sub m_progress($) {
+	my $msg = shift;
+	print "progress $msg\n" if $machine;
 }
 sub trace($) {
 	out shift if $trace;
@@ -190,6 +210,7 @@ sub jws_nonce {
 sub jws_flattened {
 	_jws_flattened({}, @_);
 }
+# X.509 {{{
 sub mkreq {
 	my $tlskey = shift;
 	my $dn = $_[0];
@@ -208,7 +229,319 @@ sub mkreq {
 	die "failed to create certificate request" if $exit;
 	encode_base64url($req);
 }
-# }}}
+
+
+package Local::DER;
+
+use Carp;
+use MIME::Base64;
+
+sub _checkpem {
+	my ($pem, $type) = @_;
+	$pem =~ /^-----BEGIN \Q$type\E-----([A-Za-z0-9\/\n+=]+)-----END \Q$type\E-----\s*$/ or die "Failed to parse $type PEM file";
+	$1 =~ s/=//gr;
+}
+sub from_pem {
+	my ($pem, $type) = @_;
+	$pem = _checkpem($pem, uc $type);
+	$pem =~ s#\n##g;
+	decode_base64($pem);
+}
+sub to_pem {
+	my ($der, $type) = @_;
+	if (ref $der) {
+		$type //= $der->{type};
+		$der = $der->{data};
+	}
+	confess "Can't convert DER to PEM without knowing the proper type" unless defined $type;
+	my $pem = join("\n", grep {$_ ne ''} split(/(.{1,64})/, encode_base64($der, '')));
+	"-----BEGIN \U$type\E-----\n$pem\n-----END \U$type\E-----\n";
+}
+sub cert_from_pem { from_pem(shift, 'certificate'); }
+sub cert_to_pem { to_pem(shift, 'certificate'); }
+sub key_from_pem { from_pem(shift, 'private key'); }
+sub key_to_pem { to_pem(shift, 'private key'); }
+sub csr_from_pem { from_pem(shift, 'certificate request'); }
+sub csr_to_pem { to_pem(shift, 'certificate request'); }
+
+sub new {
+	my $class = shift;
+	my $data = shift;
+	my $type = shift;
+	my $pos = shift // 0;
+
+	if ($data =~ /^\s*-----BEGIN ([^-]+)-----.*^-----END \1-----\s*$/ms) {
+		die "Loaded PEM data of type '$1' but expected '$type'" if defined $type && $type ne $1;
+		$type = $1;
+		$data = from_pem($data, $type);
+	}
+
+	bless {
+		data => $data,
+		pos => $pos,
+		type => $type,
+	}, $class;
+}
+sub pem {
+	my $self = shift;
+	to_pem($self->data, $self->type);
+}
+sub _moar {
+	my $self = shift;
+	my $count = shift // 1;
+	my $pos = $self->{pos};
+	confess "DER parse error: element longer than input at offset $pos" if length($self->{data}) < ($pos + $count);
+	$self->{pos} += $count;
+	my $res = substr($self->{data}, $pos, $count);
+	$res;
+}
+sub _len {
+	my $self = shift;
+	my $lpos = $self->pos;
+	my $len = ord $self->_moar;
+	return $len unless ($len & 0x80);
+
+	# Multi-byte length info
+	$len &= 0x7f;
+	confess "DER parse error: indefinite length info not allowed in DER at offset $lpos" if $len == 0;
+	confess "DER parse error: invalid length information at offset $lpos" if $len == 0x7f;
+	confess "DER parse error: sizes > 4 GB not supported at offset $lpos" if $len > 4;
+	$len = $self->_moar($len);
+	$len = "\0$len" while length($len) < 4;
+	unpack('N', $len);
+}
+sub next {
+	my $self = shift;
+	my $implicit_tag = shift;
+	my $implicit_len = shift;
+	my $epos = $self->{pos};
+	my ($type, $len);
+	
+	if (defined $implicit_tag) {
+		$type = $implicit_tag;
+		$len = $implicit_len;
+	} else {
+		$type = ord $self->_moar;
+		if ($type == 0) {
+			$self->{last} = 'EOC';
+			return 0;
+		}
+		$len = $self->_len;
+	}
+
+	my $cpos = $self->{pos};
+	if ($type == 1) { # BOOLEAN
+		croak "DER parse error: BOOLEAN value longer than one byte at offset $epos" unless $len == 1;
+		$self->{last} = 'BOOLEAN';
+		return ord $self->_moar;
+	} elsif ($type == 2) { # INTEGER
+		$self->{last} = 'INTEGER';
+		my $val = $self->_moar($len);
+		my $res = 0;
+		for my $c (split(//, $val)) {
+			$res *= 256;
+			$res += ord($c);
+		}
+		return $res;
+	} elsif ($type == 3) { # BIT STRING
+		my $pad = ord $self->_moar;
+		croak "DER parse error: bit string with incomplete final octet not supported at offset $epos" if $pad != 0;
+		$self->{last} = 'BIT STRING';
+		return $self->_moar($len-1);
+	} elsif ($type == 4) { # OCTET STRING
+		$self->{last} = 'OCTET STRING';
+		return $self->_moar($len);
+	} elsif ($type == 5) { # NULL
+		croak "DER parse error: non-empty NULL value at offset $epos" unless $len == 0;
+		$self->{last} = 'NULL';
+		return 0;
+	} elsif ($type == 6) { # OBJECT IDENTIFIER
+		my @out;
+		my $first = ord $self->_moar;
+		push @out, int($first / 40), ($first % 40);
+		my $rest = $self->_moar($len - 1);
+		push @out, unpack('w*', $rest) if $len > 1;
+		$self->{last} = 'OBJECT IDENTIFIER';
+		return join('.', @out);
+	} elsif ($type == 0x0c) { # UTF8String
+		$self->{last} = 'UTF8String';
+		return Encode::decode_utf8($self->_moar($len));
+	} elsif ($type == 0x0d) { # RELATIVE-OID
+		$self->{last} = 'RELATIVE-OID';
+		return join('.', unpack('w*', $self->_moar($len)));
+	} elsif ($type == 0x13) { # PrintableString
+		$self->{last} = 'PrintableString';
+		return $self->_moar($len);
+	} elsif ($type == 0x16) { # IA5String
+		$self->{last} = 'IA5String';
+		return $self->_moar($len);
+	} elsif ($type == 0x17) { # UTCTime
+		my $str = $self->_moar($len);
+		$self->{last} = 'UTCTime';
+		if ($str =~ /(.*)Z$/) {
+			return Time::Piece->strptime($1, "%y%m%d%H%M%S")->epoch if $len eq 13;
+			return Time::Piece->strptime($1, "%y%m%d%H%M")->epoch;
+		}
+		return Time::Piece->strptime($str, "%y%m%d%H%M%S%z")->epoch if $len eq 17;
+		return Time::Piece->strptime($str, "%y%m%d%H%M%z")->epoch;
+	} elsif ($type == 0x18) { # GeneralizedTime
+		my $str = $self->_moar($len);
+		my ($format, $offset) = ('%Y%m%d%H', 0);
+		my ($dt, $tz, $tzval) = split(/([Z+-])/, $str);
+		($dt, $offset) = split(/\./, $dt, 2);
+		$offset //= 0;
+		$offset = "0.$offset" if $offset;
+		if ($dt =~ /^\d{10}$/) { # YYYYmmddHH
+			$offset *= 3600;
+		} elsif ($dt =~ /\d{12}$/) { # YYYYmmddHHMM
+			$format .= '%M';
+			$offset *= 60;
+		} else {
+			$format .= '%M%S';
+		}
+		$self->{last} = 'GeneralizedTime';
+		return Time::Piece->new->strptime($dt, $format) + $offset unless $tz; # undocumented way to signal localtime
+		return Time::Piece->strptime($dt, $format) + $offset if $tz eq 'Z';
+		my $val = Time::Piece->strptime($dt, $format) + $offset;
+		my ($hr, $min) = ($tzval =~ /^(\d\d)(\d\d)$/);
+		if ($tz eq '+') {
+			$val += ($hr * 3600) + ($min * 60);
+		} else {
+			$val -= ($hr * 3600) + ($min * 60);
+		}
+		return $val;
+	} elsif ($type == 0x30) { # SEQUENCE/SEQUENCE OF (0x10 | constructed 0x20)
+		$self->{last} = 'SEQUENCE';
+		return Local::DER->new($self->_moar($len));
+	} elsif ($type == 0x31) { # SET/SET OF (0x11 | constructed 0x20)
+		$self->{last} = 'SET';
+		return Local::DER->new($self->_moar($len));
+	} elsif (($type & 0xf0) == 0xa0) { # sequence identifier
+		$self->{last} = '_identifier';
+		return [$type & 0x1f, Local::DER->new($self->_moar($len))];
+	} elsif (($type & 0xf0) == 0x80) { # application-specific tag
+		$self->{last} = '_apptag';
+		return [$type & 0x1f, Local::DER->new($self->_moar($len))];
+	}
+}
+sub next_as {
+	my ($self, $val, $msg) = @_;
+	my $res = $self->next;
+	return $res if $self->{last} eq $val;
+	confess $msg;
+}
+sub next_rawint {
+	my $self = shift;
+	my $type = ord $self->_moar;
+	confess "DER parse error: expected INTEGER but got tag $type" unless $type == 2;
+	my $len = $self->_len;
+	$self->_moar($len);
+}
+sub last { shift->{'last'}; }
+sub pos { shift->{'pos'}; }
+sub end {
+	my $self = shift;
+	$self->{pos} == length $self->{data};
+}
+sub data { shift->{data}; }
+sub type { shift->{type}; }
+sub next_seq {
+	my ($self, $type) = @_;
+	my $res = $self->next_as('SEQUENCE', "DER parse failed: expected '$type' sequence but got random garbage");
+}
+sub next_set {
+	my ($self, $type) = @_;
+	my $res = $self->next_as('SET', "DER parse failed: expected '$type' set but got random garbage");
+}
+sub cert_info {
+	my $self = shift;
+	my $c = $self->next_seq('Certificate');
+	$c = $c->next_seq('TBSCertficate');
+	my $res = {
+		version => 0,
+	};
+
+	# version
+	my $elem = $c->next;
+	croak "Invalid certificate: default X.509 version (v1) used and we support only v3" unless $c->last eq '_identifier' && $elem->[0] == 0;
+	$elem = $elem->[1];
+	$res->{version} = $elem->next;
+	croak "Invalid certificate: X.509 version is not v3 (we support only that)" unless $elem->last eq 'INTEGER' && $res->{version} == 2; # 2 = v3
+
+	# serialNumber
+	$elem = $c->next_as('INTEGER', "Invalid certificate: expected serialNumber, got something else");
+
+	# signature
+	$elem = $c->next_seq('signature');
+
+	# issuer
+	$elem = $c->next_seq('issuer');
+
+	# validity (finally something useful)
+	$elem = $c->next_seq('validity');
+	my $from = $elem->next;
+	croak "Invalid certificate: expected 'valid not before', got something else" unless $elem->last =~ /^(?:UTC|Generalized)Time$/;
+	$res->{validfrom} = $from;
+	my $to = $elem->next;
+	croak "Invalid certificate: expected 'valid not after', got something else" unless $elem->last =~ /^(?:UTC|Generalized)Time$/;
+	$res->{validto} = $to;
+
+	# subject
+	$elem = $c->next_seq('subject');
+	$elem = $elem->next_set('subject');
+	while (my $rdn = $elem->next_seq('subject attribute')) {
+		my $oid = $rdn->next;
+		next unless $oid eq '2.5.4.3'; # cn
+		$res->{cn} = $rdn->next;
+		last;
+	}
+
+	# subjectPublicKeyInfo
+	$elem = $c->next_seq('subjectPublicKeyInfo');
+	my $pki = $elem->next_seq('algorithm');
+	my $algid = $pki->next;
+	croak "Unsupported certificate: public key type isn't RSA" unless $algid eq '1.2.840.113549.1.1.1';
+	$pki->next_as('NULL', "Unsupported certificate: RSA parameter isn't NULL, unlike specified in PKCS#1");
+	$pki = $elem->next_as('BIT STRING', "Invalid certificate: public key data in unexpected format");
+	$pki = Local::DER->new($pki);
+	$pki = $pki->next_seq("Invalid certificate: public key data doesn't contain public key container");
+	my $mod = $pki->next_as('INTEGER', "Invalid certificate: modulus not found in public key data");
+	my $exp = $pki->next_as('INTEGER', "Invalid certificate: exponent not found in public key data");
+
+	# optional fields
+	while ($elem = $c->next) {
+		croak "Invalid certificate: found trailing element that is not one of the valid optional elements" unless $c->last eq '_identifier' && grep {$_ == $elem->[0]} (1,2,3);
+		next unless $elem->[0] == 3;
+		$elem = $elem->[1];
+		last;
+	}
+	$elem = $elem->next_seq('extensions');
+	$res->{altnames} = [];
+	my $ext;
+	while (!$elem->end && ($ext = $elem->next_seq('extension'))) {
+		my $id = $ext->next_as('OBJECT IDENTIFIER', "Invalid certificate: found extension without an ID");
+		next unless $id eq '2.5.29.17'; # subjectAltName
+
+		my $next = $ext->next;
+		# SMELL: we're violating the letter of X.509 here by not aborting when we find critical extensions we don't support
+		$next = $ext->next if $ext->last eq 'BOOLEAN';
+		confess "Invalid certificate: extension payload is not an octet string" unless $ext->last eq 'OCTET STRING';
+		$ext = Local::DER->new($next);
+
+		$ext = $ext->next_seq("subjectAltName list");
+		my $gn;
+		while (!$ext->end && ($gn = $ext->next_as('_apptag', "Invalid certificate: unexpected raw data in list of subjectAltNames"))) {
+			next unless $gn->[0] == 2; # dNSName
+			$gn = $gn->[1]->data;
+			push @{$res->{altnames}}, $gn;
+		}
+	}
+	$res;
+}
+
+package main;
+# }}} X.509
+# }}} Crypto and JWS fun
 # ACME protocol {{{
 sub _process_nonce {
 	my $nonce = shift;
@@ -224,14 +557,18 @@ sub _acme_response {
 
 	trace "HTTP Response ------------------------------------\n". $res->as_string .
 		"--------------------------------------------------";
+	$res;
+}
+sub _acme_fail {
+	my $res = shift;
+
 	if ($res->is_error) {
-		out "Error from server: ". $res->status_line;
+		putdata('error', "Error from server: %s", $res->status_line);
 		exit(1) if (($res->header('client-warning') // '') eq 'Internal response');
 		my $err = decode_json($res->decoded_content);
-		out "Error details: ". $err->{detail};
+		putdata('error-json', "Error details: %s", $err->{detail});
 		exit(1);
 	}
-	$res;
 }
 sub _acme_plain {
 	my $url = shift;
@@ -269,6 +606,7 @@ sub acme {
 sub acme_directory {
 	info "Fetching directory";
 	my $res = acme($directory);
+	_acme_fail($res);
 	%resources = %{decode_json($res->decoded_content)};
 }
 sub acme_new {
@@ -286,6 +624,7 @@ GetOptions(
 	'config|c=s'	=> \$config_dir,
 	'verbose|v!'	=> \$verbose,
 	'trace|t!'	=> \$trace,
+	'machine|m!'	=> \$machine,
 	'version'	=> sub { out "placme version $VERSION"; exit; },
 );
 
@@ -296,6 +635,135 @@ if (-f cfgfile('directory')) {
 	$directory = 'https://acme-v01.api.letsencrypt.org/directory';
 }
 $ua->show_progress(1) if $verbose;
+
+$friendlyjson = JSON->new->utf8;
+$friendlyjson->pretty->canonical unless $machine;
+
+# Plumbing (base blocks of low-level implementation) {{{
+sub initconf {
+	my %opts = @_;
+	my $parent = getparentdir($config_dir);
+	make_path($parent);
+	make_path($config_dir, { mode => 0700 });
+	1;
+}
+sub chconf {
+	my %opts = @_;
+	while (my ($k, $v) = each(%opts)) {
+		cfgspurt($k, $v);
+	}
+}
+sub mkkey {
+	my %opts = @_;
+	my $bits = $opts{bits};
+	openssl(undef, 'genpkey',
+		-algorithm => 'RSA',
+		-out => $keyfile,
+		-pkeyopt => "rsa_keygen_bits:$bits"
+	);
+	!$exit;
+}
+sub _badresponse {
+	my $res = shift;
+	my $msg = shift || "Unexpected response from server";
+	return {
+		res => 0,
+		msg => "$msg",
+		response => $res,
+	};
+}
+sub _badbail {
+	my $res = shift;
+	return if $res->{res};
+	putdata('error', '%s', $res->{msg});
+	my $resp;
+	if (($res->{response}->header('client-warning') // '') eq 'Internal response') {
+		$resp = {
+			response => $res->{response}->as_string
+		};
+	} else {
+		$resp = decode_json($res->{response}->decoded_content);
+	}
+	putdata('error-json', 'Error details: %s', $friendlyjson->encode($resp));
+	exit;
+}
+sub _goodresponse {
+	my $res = shift;
+	my $data = decode_json($res->decoded_content);
+	return {
+		res => 1,
+		url => $res->header('location'),
+		data => $data,
+		rawdata => $friendlyjson->encode($data),
+		@_,
+	};
+}
+sub reg {
+	my %opts = @_;
+	my $res = acme_new('new-reg',
+		contact => $opts{contacts},
+	);
+	return _badresponse($res) unless $res->code eq '201';
+	_goodresponse($res,
+		tos => _acme_link($res, 'terms-of-service'),
+	);
+}
+sub updatereg {
+	my %opts = @_;
+	my $res = acme(delete $opts{reg},
+		resource => 'reg',
+		%opts,
+	);
+	return _badresponse($res) unless $res->code eq '202';
+	_goodresponse($res,
+		tos => _acme_link($res, 'terms-of-service')
+	);
+}
+sub authz {
+	my %opts = @_;
+	my $res = acme_new('new-authz',
+		identifier => {
+			type => 'dns',
+			value => $opts{domain},
+		},
+	);
+	return _badresponse($res) unless $res->code eq '201';
+	my $obj = decode_json($res->decoded_content);
+	my $ch_http = grep { $_->{type} eq 'http-01' } @{$obj->{challenges}};
+	_goodresponse($res,
+		status => $obj->{status},
+	);
+}
+sub getauthz {
+	my %opts = @_;
+	my $res = acme($opts{url});
+	return _badresponse($res) unless $res->code =~ /^20[02]$/;
+	my $obj = decode_json($res->decoded_content);
+	_goodresponse($res,
+		authzurl => _acme_link($res, 'up'),
+		code => $res->code,
+		status => $obj->{status},
+		delay => $res->header('retry-after'),
+	);
+}
+sub confirm {
+	my %opts = @_;
+	my $res = acme($opts{url},
+		resource => 'challenge',
+		type => $opts{type},
+		keyAuthorization => "$opts{token}.$opts{thumb}",
+	);
+	return _badresponse($res) unless $res->code =~ /^20[02]$/;
+	my $obj = decode_json($res->decoded_content);
+	_goodresponse($res,
+		authzurl => _acme_link($res, 'up'),
+		code => $res->code,
+		status => $obj->{status},
+		delay => $res->header('retry-after') // undef,
+	);
+}
+
+#}}}
 
 my %ops; %ops = (
 	help => sub { #{{{
@@ -316,14 +784,10 @@ my %ops; %ops = (
 			'directory|d=s' => \$directory,
 		);
 		if (!-d $config_dir) {
-			my $parent = getparentdir($config_dir);
-			make_path($parent);
-			make_path($config_dir, { mode => 0700 });
-			noise "Created config dir: $config_dir";
+			initconf(directory => $directory);
+			putdata('initconf-done', 'Config dir created: %s', $config_dir);
 		}
-		if ($directory) {
-			cfgspurt('directory', $directory);
-		}
+		chconf(directory => $directory) if $directory;
 	}, #}}}
 	mkkey => sub { #{{{
 		my $bits = 2048;
@@ -331,13 +795,9 @@ my %ops; %ops = (
 			'bits|b=i' => \$bits,
 		);
 		-f $keyfile && die "mkkey: account_key.pem already exists";
-		openssl(undef, 'genpkey',
-			-algorithm => 'RSA',
-			-out => $keyfile,
-			-pkeyopt => "rsa_keygen_bits:$bits"
-		);
-		die "mkkey: generation failed" if $exit;
-		out "mkkey: created key.";
+		my $res = mkkey(bits => $bits);
+		die "mkkey: generation failed" unless $res;
+		putdata('mkkey-done', 'Account key created: %s', $keyfile);
 	}, #}}}
 	reg => sub { #{{{
 		if (-f cfgfile('registration')) {
@@ -350,27 +810,23 @@ my %ops; %ops = (
 			'contact=s' => \@contacts,
 		);
 		pod2usage("reg: no contact(s) given") unless @contacts;
-		my $res = acme_new('new-reg',
-			contact => \@contacts,
-		);
-		if ($res->code eq '201') {
-			noise "Registration successful.";
-			cfgspurt('registration', $res->header('location'));
-			my $tos = _acme_link($res, 'terms-of-service');
-			if ($tos) {
-				if ($autoagree) {
-					info "Automatically agreeing to TOS (tsk, tsk)";
-					@ARGV = ("--agreement=$tos");
-					$ops{updatereg}->();
-					exit;
-				}
-				noise "Depending on the server's policies, you may need to agree to the TOS";
-				noise "by running: placme updatereg --agreement=<TOS URL>.";
-				noise "Terms of service URL: $tos";
+		m_progress('reg');
+		my $res = reg(contact => \@contacts);
+		_badbail($res);
+		putdata('regurl', 'Registration successful, stored at %s', $res->{url});
+		cfgspurt('registration', $res->{url});
+		if ($res->{tos}) {
+			if ($autoagree) {
+				info "Automatically agreeing to TOS (tsk, tsk)";
+				@ARGV = ("--agreement=$res->{tos}");
+				$ops{updatereg}->();
+				exit;
 			}
-			print(($tos || '') ."\n");
-			print $res->decoded_content;
+			noise "Depending on the server's policies, you may need to agree to the TOS";
+			noise "by running: placme updatereg --agreement=$res->{tos}";
 		}
+		putdata('tosurl', 'Link to terms of service: %s', $res->{tos}) if $res->{tos};
+		putdata(-v => 'reg', 'Full registration data follows: %s', $res->{rawdata});
 	}, #}}}
 	updatereg => sub { #{{{
 		my $reg = cfgslurp('registration');
@@ -382,21 +838,15 @@ my %ops; %ops = (
 		my %payload;
 		$payload{agreement} = $agreement if $agreement;
 		$payload{contact} = \@contacts if @contacts;
-		my $res = acme($reg,
-			resource => 'reg',
-			%payload,
-		);
-		unless ($res->code eq '202') {
-			die "updatereg: unexpected status code, full response follows:\n". $res->as_string;
-		}
-		my $data = decode_json($res->decoded_content);
-		my $tos = _acme_link($res, 'terms-of-service');
-		if ($tos && (!$data->{agreement} || $data->{agreement} ne $tos)) {
-			out "URL for terms of service which you have not accepted yet: $tos";
+		m_progress('updatereg');
+		my $res = updatereg($reg, %payload);
+		_badbail($res);
+		if ($res->{tos} && (!$res->{data}{agreement} || $res->{data}{agreement} ne $res->{tos})) {
+			out "URL for terms of service which you have not accepted yet: $res->{tos}";
 			out "Use updatereg --agreement=<URL> to confirm agreement.";
+			putdata('tosurl', "URL for terms of service which you have not accepted yet: %s\nUse updatereg --agreement=<URL> to confirm agreement.", $res->{tos} || '');
 		}
-		print(($tos || '') ."\n");
-		print $res->decoded_content;
+		putdata(-v => 'reg', 'Registration data updated: %s', $res->{rawdata});
 	}, #}}}
 	authz => sub { #{{{
 		my ($auto_http, $domain);
@@ -405,31 +855,25 @@ my %ops; %ops = (
 			'domain|d=s' => \$domain,
 		);
 		pod2usage("authz: need domain parameter") unless $domain;
-		my $res = acme_new('new-authz',
-			identifier => {
-				type => 'dns',
-				value => $domain,
-			},
-		);
-		die "authz: unexpected status code from server (".$res->code.")" unless $res->code eq '201';
+		m_progress('authz');
+		my $res = authz(domain => $domain);
+		_badbail($res);
 		noise "Authorization is now pending.";
-		unless (defined $auto_http) {
-			print "uri ". $res->header('location') ."\n";
-			print "data ". $res->decoded_content;
-			exit;
-		}
-		my $authz = decode_json($res->decoded_content);
-		unless ($authz->{status} eq 'pending') {
+		putdata('authzuri', 'Authorization info available here: %s', $res->{url});
+		putdata(-v => 'authz', 'Current data about authorization: %s', $res->{rawdata});
+		exit unless defined $auto_http;
+
+		unless ($res->{status} eq 'pending') {
 			out "authz: authorization response from server is not marked as pending.";
 			out "Please manually review the response:";
-			out $res->decoded_content;
+			out $res->{rawdata};
 			exit(1);
 		}
-		my ($ch_http) = grep { $_->{type} eq 'http-01' } @{$authz->{challenges}};
+		my ($ch_http) = grep { $_->{type} eq 'http-01' } @{$res->{data}{challenges}};
 		unless ($ch_http) {
 			out "authz: no HTTP challenge found in authorization response";
 			out "Please manually review the response:";
-			out $res->decoded_content;
+			out $res->{rawdata};
 			exit(1);
 		}
 		unshift(@ARGV,
@@ -439,19 +883,20 @@ my %ops; %ops = (
 		unshift(@ARGV,
 			"--url=$ch_http->{uri}",
 		) if $auto_http eq 'send';
-		print "token $ch_http->{token}\n";
-		print "uri $ch_http->{uri}\n";
+		putdata('chtoken', 'HTTP challenge token: %s', $ch_http->{token});
+		putdata('churl', 'URL for submitting HTTP challenge: %s', $ch_http->{uri});
 		$ops{confirm}->();
 	}, #}}}
 	confirm => sub { #{{{
-		my ($url, $token, $wait, $in, $send, $skip_keyauth, $keyauth_out);
+		my ($url, $token, $wait, $in, $send, $skip_keyauth, $keyauth_out, $keyauth_dir);
 		my $type = 'http-01';
 		GetOptions(
 			'url|u=s' => \$url,
 			'type|T=s' => \$type,
 			'token|t=s' => \$token,
 			'skip-keyauth|K' => \$skip_keyauth,
-			'keyauth-out=s' => \$keyauth_out,
+			'keyauth-out|o=s' => \$keyauth_out,
+			'keyauth-dir|O=s' => \$keyauth_dir,
 			'wait|w=i' => \$wait,
 		);
 		pod2usage("confirm: requires --token=...") unless $token;
@@ -463,49 +908,53 @@ my %ops; %ops = (
 				noise "using the following name:";
 				noise ".well-known/acme-challenge/$token";
 			}
-			if ($keyauth_out) {
+			if ($keyauth_dir) {
+				spurt(File::Spec->catfile($keyauth_dir, $token), "$token.$thumb");
+			} elsif ($keyauth_out) {
 				$keyauth_out =~ s!:TOKEN:!$token!g;
 				spurt($keyauth_out, "$token.$thumb");
 			} else {
-				print "keyauth $token.$thumb\n";
+				putdata('keyauth', 'Key authorization string for the challenge: %s', "$token.$thumb");
 			}
 			exit unless $url;
 		}
 		pod2usage("confirm: need --url=...") unless $url;
 
-		my $res = acme($url,
-			resource => 'challenge',
+		my $res = confirm(
+			url => $url,
 			type => $type,
-			keyAuthorization => "$token.$thumb",
+			token => $token,
+			thumb => $thumb,
 		);
+		_badbail($res);
 		my $authz_url = _acme_link($res, 'up');
-		print "uri ". $res->header('location') ."\n";
+		putdata(-v => 'authzurl', 'Authorization info URL: %s', $res->{authzurl});
+		putdata(-v => 'challengeurl', 'Challenge info URL: %s', $res->{url});
 		my $first_try = time;
 		my $checkauthz; $checkauthz = sub {
-			if ($res->code eq '200') {
-				print "data ". $res->decoded_content ."\n";
-				my $authz = decode_json($res->decoded_content);
-				exit if $authz->{status} eq 'active';
+			_badbail($res);
+			if ($res->{code} eq '200') {
+				putdata(-v => 'authz', 'Authorization data: %s', $res->{rawdata});
+				exit if $res->{status} eq 'active';
 				exit(1);
-			} elsif ($res->code eq '202') {
+			} elsif ($res->{code} eq '202') {
 				if (time - $first_try > $wait) {
 					out "Wait timeout exceeded, please check manually later.";
 					exit(1);
 				}
-				my $delay = $res->header('retry-after') || 5;
-				info "Waiting $wait seconds to re-check...";
+				my $delay = $res->{delay} || 5;
+				info "Waiting $delay seconds to re-check...";
 				sleep($delay);
-				$res = acme($authz_url);
+				$res = getauthz(url => $res->{authzurl});
 				$checkauthz->();
 			} else {
-				die "confirm: unexpected result from server: ".$res->decoded_content;
+				confess "Bug in placme, please report";
 			}
 		};
 		if ($wait) {
 			$checkauthz->();
 		} else {
-			print "uri $authz_url\n";
-			print "data ". $res->decoded_content;
+			putdata('authz', 'Authorization data: %s', $res->{rawdata});
 		}
 	}, #}}}
 	cert => sub { #{{{
@@ -515,6 +964,7 @@ my %ops; %ops = (
 			'key|k=s' => \$key,
 			'out|o=s' => \$out,
 		);
+		# TODO change interface to use a single --in and autodetect type
 		my @domains = @ARGV;
 		pod2usage("cert: need --csr or --key") unless defined($csr) || $key;
 		pod2usage("cert: --csr and --key are mutually exclusive") if $csr && $key;
@@ -528,11 +978,8 @@ my %ops; %ops = (
 				local $/;
 				$csr = <STDIN>;
 			}
-			$csr = openssl($csr, 'req',
-				-outform => 'der',
-			);
-			die "cert: couldn't convert CSR to DER format" if $exit;
-			$csr = encode_base64url($csr);
+			$csr = Local::DER->new($csr, 'certificate request');
+			$csr = encode_base64url($csr->data);
 		} else {
 			pod2usage("cert: need list of domains") unless @domains;
 			$csr = mkreq($key, @domains);
@@ -541,10 +988,7 @@ my %ops; %ops = (
 			csr => $csr,
 		);
 		if ($res->code eq '201') {
-			$res = openssl($res->decoded_content, 'x509',
-				-inform => 'der',
-			);
-			die "cert: could not convert certificate to PEM" if $exit;
+			$res = cert_der2pem($res->decoded_content);
 			if ($out) {
 				spurt($out, $res);
 			} else {
@@ -553,7 +997,7 @@ my %ops; %ops = (
 		} else {
 			out "cert: certificate request accepted but certificate not ready yet.";
 			out "This case is not currently supported by placme.";
-			out "Please fetch the certificate yourself at this location after ~". $res->header('retry-after') ." seconds:";
+			out sprintf("Please fetch the certificate yourself at this location after ~%s seconds:", $res->header('retry-after'));
 			out $res->header('location');
 			exit(1);
 		}
@@ -569,10 +1013,7 @@ my %ops; %ops = (
 			local $/;
 			$in = <STDIN>;
 		}
-		$in = openssl($in, 'x509',
-			-outform => 'der',
-		);
-		die "revoke: could not convert certificate to DER" if $exit;
+		$in = Local::DER->new($in, 'certificate')->data;
 		my $res = acme_new('revoke-cert',
 			certificate => encode_base64url($in),
 		);
@@ -581,6 +1022,18 @@ my %ops; %ops = (
 			exit;
 		}
 		die "revoke: unexpected result from server: ". $res->decoded_content;
+	}, # }}}
+	certinfo => sub { #{{{
+		my $in = shift @ARGV;
+		if ($in) {
+			$in = slurp($in);
+		} else {
+			local $/;
+			$in = <STDIN>;
+		}
+		$in = Local::DER->new($in, 'certificate');
+		$in = $in->cert_info;
+		print $friendlyjson->encode($in);
 	}, #}}}
 );
 
@@ -607,7 +1060,7 @@ placme - Perl client for the ACME protocol (used by e.g. Let's Encrypt)
  placme bootstrap --contact=mailto:me@example.org
  placme updatereg --agreement=...
  placme authz --http=send --domain=<domain> --wait=30
-     --keyauth-out=/www/<domain>/.well-known/acme-challenge/:TOKEN:
+     --keyauth-dir=/www/<domain>/.well-known/acme-challenge
  placme cert --key=<tls.key> <domain>...
 
 =head1 OPTIONS
@@ -622,8 +1075,20 @@ operation name.
 Sets a path to store configuration and persistent data for an
 account. Defaults to F<~/.config/placme>.
 
-If you want to use multiple accounts, you should use multiple config paths,
-too.
+If you want to use multiple accounts, you should use multiple config
+directories, too.
+
+=item B<--machine, -m>
+
+Turns on machine-readable output: all bits of data are printed one per line
+in the format "type E<lt>spaceE<gt> data", where "type" is a keyword that
+describes what data is being output. "type", as well as the format of the data
+following it, is guaranteed to never change in a future release of placme.
+
+=item B<--quiet, -q>
+
+Reduces output to the absolute minimum (only things absolutely needed to
+continue to the next step.
 
 =item B<--trace, -t>
 
@@ -640,24 +1105,81 @@ Shows the placme version and exits.
 
 =back
 
+=head2 High-level commands
+
+ bootstrap   Creates a new config directory with a private key, and
+             registers an account.
+ addcert     Adds a (not yet created) certificate to the registry.
+ auto        Makes sure all of your registered certificates are created
+             and/or updated, using the HTTP challenge method.
+ rmcert      Revokes, deregisters and deletes a certificate.
+
+=head2 Low-level commands
+
+ initconf    Creates a new config directory.
+ mkkey       Creates a private key in the config directory.
+ reg         Registers an account for the private key.
+ updatereg   Queries/updates an existing registration.
+ authz       Requests authorization for a domain name.
+ confirm     Submits confirmation that the challenge for an authorization
+             has been fulfilled.
+ cert        Requests a certificate for a set of authorized domain names.
+ revoke      Requests revocation of a certificate.
+
 =head1 OPERATIONS
 
 =head2 bootstrap
 
-Runs initconf, mkkey, and reg (creates the config path wih a keypair and
+Runs initconf, mkkey, and reg (creates the config directory wih a keypair and
 registers an account using that keypair).
 
 It accepts all corresponding options, but they need to be specified in the
-correct order: mkkey first and then reg (initconf has no options).
+correct order (as listed below).
+
+=head3 Options
+
+=over 4
+
+=item B<--directory=..., -d ...>
+
+Sets the URL where the ACME server's resource directory can be queried.
+C<initconf> can be run again later to change this.
+
+If not set, the letsencrypt.org ACME server will be used.
+
+=item B<--bits=...>
+
+The size of the key, defaults to 2048. My personal understanding is that
+smaller values are considered to be somewhat insecure and that the benefit to
+bigger values is not nearly as much as you might think. If you care, look it
+up.
+
+=item B<--contact=I<URI>>
+
+Specifies a contact to be associated with the account. It may be given
+multiple times.
+
+This information is typically held private by the ACME server and it's a
+really good idea to specify at least one e-mail address
+(C<mailto:foo@example.org>). For this reason, placme requires at least one
+instance of this option, even if the server does not.
+
+=item B<--autoagree>
+
+Automatically agree to the terms of service. Legally speaking, this is
+probably not a good idea. You can manually agree to the terms of service using
+the C<updatereg> operation.
+
+=back
 
 =head2 initconf
 
-Creates the config path (if it does not already exist).
+Creates the config directory (if it does not already exist).
 
-The config path will be readable only for the current user by default, for
-security reasons (but parents automatically created by C<initconf> will have
-permissions according to your umask). Feel free to change its mode but do so
-at your own risk.
+The config directory will be readable only for the current user by default,
+for security reasons (but parents automatically created by C<initconf> will
+have permissions according to your umask). Feel free to change its mode but do
+so at your own risk.
 
 =head3 Options
 
@@ -674,8 +1196,8 @@ If not set, the letsencrypt.org ACME server will be used.
 
 =head2 mkkey
 
-Creates an account keypair in the config path, with the name
-F<account_key.pem>. Only one keypair per config path is supported.
+Creates an account keypair in the config directory, with the name
+F<account_key.pem>. Only one keypair per config directory is supported.
 
 =head3 Options
 
@@ -692,7 +1214,7 @@ up.
 
 =head2 reg
 
-Registers an account for the keypair in the config path.
+Registers an account for the keypair in the config directory.
 
 =head3 Options
 
@@ -768,6 +1290,15 @@ the C<=send>). You can pass any of C<confirm>'s options after C<authz>'s
 options, though of course you'll want to leave out C<--type>, C<--token> and
 C<--url>.
 
+To automatically extract the token and URL for the HTTP challenge and
+generate the keyauth string, use C<--http>.
+
+To also place the keyauth file in a specific directory (e.g.
+F</www/example.org/.well-known/acme-challenge>) and directly let the ACME
+server verify it, use C<--keyauth-dir=...> (see the C<confirm> command) and
+C<--http=send>. (You may want to also include C<confirm>'s C<--wait=...> to
+wait for the server's verdict.)
+
 =head2 confirm
 
 Prepares (and optionally submits) confirmation of the challenge.
@@ -814,11 +1345,18 @@ for the second time.
 
 =item B<--keyauth-out=..., -o ...>
 
-Where to write the I<key authorization> string to. You can use the special
-placeholder C<:TOKEN:> in this path to have it replaced with the challenge
-token (in case you're sending confirmation at the same time you're generating
-the key authorization), since that is what's required for HTTP-based
-challenges.
+Where to write the I<key authorization> string to.
+
+You can use the special placeholder C<:TOKEN:> in this path to have it
+replaced with the challenge token (in case you're sending confirmation at the
+same time you're generating the key authorization), since that is what's
+required for HTTP-based challenges. Or you can simply use the B<--keyauth-dir>
+option below.
+
+=item B<--keyauth-dir=..., -O ...>
+
+Use this instead of B<--keyauth-out> to simply specify a directory into which
+the key authorization file will be placed with the correct name.
 
 =item B<--wait=..., -w ...>
 
@@ -868,6 +1406,11 @@ list if you have no authorization for any of them.
 This has no effect if you supply your own CSR.
 
 =back
+
+=head2 revoke
+
+Revokes a previously issued certificate. Expects the name of a certificate
+file as its parameter, or the certificate data via standard input.
 
 =head1 LIMITATIONS
 
