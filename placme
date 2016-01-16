@@ -1290,6 +1290,15 @@ the C<=send>). You can pass any of C<confirm>'s options after C<authz>'s
 options, though of course you'll want to leave out C<--type>, C<--token> and
 C<--url>.
 
+To automatically extract the token and URL for the HTTP challenge and
+generate the keyauth string, use C<--http>.
+
+To also place the keyauth file in a specific directory (e.g.
+F</www/example.org/.well-known/acme-challenge>) and directly let the ACME
+server verify it, use C<--keyauth-dir=...> (see the C<confirm> command) and
+C<--http=send>. (You may want to also include C<confirm>'s C<--wait=...> to
+wait for the server's verdict.)
+
 =head2 confirm
 
 Prepares (and optionally submits) confirmation of the challenge.
