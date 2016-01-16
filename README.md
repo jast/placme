@@ -12,6 +12,13 @@ Design goals:
 * Provide a toolbox for scripting your own solutions as well as a fully
   automated mode (not implemented yet)
 
+Dependencies:
+
+* JSON Perl package
+* LWP Perl package (Debian: libwww-perl)
+* OpenSSL binary
+* Perl 5.12 or newer
+
 ## A brief introduction to ACME with placme
 
 placme stores all of its working data in a single directory (called the config
