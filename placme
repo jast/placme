@@ -988,7 +988,7 @@ my %ops; %ops = (
 			csr => $csr,
 		);
 		if ($res->code eq '201') {
-			$res = cert_der2pem($res->decoded_content);
+			$res = Local::DER::to_pem($res->decoded_content, 'certificate');
 			if ($out) {
 				spurt($out, $res);
 			} else {
