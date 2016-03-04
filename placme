@@ -692,7 +692,7 @@ sub _goodresponse {
 	my $data = decode_json($res->decoded_content);
 	return {
 		res => 1,
-		url => $res->header('location'),
+		url => $res->header('location') // undef,
 		data => $data,
 		rawdata => $friendlyjson->encode($data),
 		@_,
@@ -740,10 +740,10 @@ sub getauthz {
 	return _badresponse($res) unless $res->code =~ /^20[02]$/;
 	my $obj = decode_json($res->decoded_content);
 	_goodresponse($res,
-		authzurl => _acme_link($res, 'up'),
+		authzurl => _acme_link($res, 'up') // undef,
 		code => $res->code,
 		status => $obj->{status},
-		delay => $res->header('retry-after'),
+		delay => $res->header('retry-after') // undef,
 	);
 }
 sub confirm {
@@ -756,7 +756,7 @@ sub confirm {
 	return _badresponse($res) unless $res->code =~ /^20[02]$/;
 	my $obj = decode_json($res->decoded_content);
 	_goodresponse($res,
-		authzurl => _acme_link($res, 'up'),
+		authzurl => _acme_link($res, 'up') // undef,
 		code => $res->code,
 		status => $obj->{status},
 		delay => $res->header('retry-after') // undef,
@@ -839,7 +839,7 @@ my %ops; %ops = (
 		$payload{agreement} = $agreement if $agreement;
 		$payload{contact} = \@contacts if @contacts;
 		m_progress('updatereg');
-		my $res = updatereg($reg, %payload);
+		my $res = updatereg(reg => $reg, %payload);
 		_badbail($res);
 		if ($res->{tos} && (!$res->{data}{agreement} || $res->{data}{agreement} ne $res->{tos})) {
 			out "URL for terms of service which you have not accepted yet: $res->{tos}";
@@ -927,7 +927,7 @@ my %ops; %ops = (
 			thumb => $thumb,
 		);
 		_badbail($res);
-		my $authz_url = _acme_link($res, 'up');
+		my $authz_url = $res->{authzurl};
 		putdata(-v => 'authzurl', 'Authorization info URL: %s', $res->{authzurl});
 		putdata(-v => 'challengeurl', 'Challenge info URL: %s', $res->{url});
 		my $first_try = time;
@@ -988,7 +988,7 @@ my %ops; %ops = (
 			csr => $csr,
 		);
 		if ($res->code eq '201') {
-			$res = cert_der2pem($res->decoded_content);
+			$res = Local::DER::to_pem($res->decoded_content, 'certificate');
 			if ($out) {
 				spurt($out, $res);
 			} else {
@@ -997,7 +997,7 @@ my %ops; %ops = (
 		} else {
 			out "cert: certificate request accepted but certificate not ready yet.";
 			out "This case is not currently supported by placme.";
-			out sprintf("Please fetch the certificate yourself at this location after ~%s seconds:", $res->header('retry-after'));
+			out sprintf("Please fetch the certificate yourself at this location after ~%s seconds:", $res->header('retry-after') // 'many');
 			out $res->header('location');
 			exit(1);
 		}
