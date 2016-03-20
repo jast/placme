@@ -78,7 +78,7 @@ sub which {
 	return;
 }
 sub getdir {
-	my ($volume, $dir, $file) = File::Spec->splitpath(@_);
+	my ($volume, $dir, $file) = File::Spec->splitpath(File::Spec->rel2abs(@_));
 	File::Spec->catpath($volume, $dir, '');
 }
 sub getparentdir {
