@@ -271,7 +271,7 @@ sub new {
 	my $pos = shift // 0;
 
 	if ($data =~ /^\s*-----BEGIN ([^-]+)-----.*^-----END \1-----\s*$/ms) {
-		die "Loaded PEM data of type '$1' but expected '$type'" if defined $type && $type ne $1;
+		die "Loaded PEM data of type '$1' but expected '$type'" if defined $type && lc($type) ne lc($1);
 		$type = $1;
 		$data = from_pem($data, $type);
 	}
@@ -978,7 +978,12 @@ my %ops; %ops = (
 				local $/;
 				$csr = <STDIN>;
 			}
-			$csr = Local::DER->new($csr, 'certificate request');
+			eval {
+				$csr = Local::DER->new($csr, 'new certificate request');
+			};
+			if ($@) {
+				$csr = Local::DER->new($csr, 'certificate request');
+			}
 			$csr = encode_base64url($csr->data);
 		} else {
 			pod2usage("cert: need list of domains") unless @domains;
