@@ -992,6 +992,7 @@ my %ops; %ops = (
 		my $res = acme_new('new-cert',
 			csr => $csr,
 		);
+		_badbail(_badresponse($res)) unless $res->code =~ /^2/;
 		if ($res->code eq '201') {
 			$res = Local::DER::to_pem($res->decoded_content, 'certificate');
 			if ($out) {
