@@ -1067,7 +1067,7 @@ placme - Perl client for the ACME protocol (used by e.g. Let's Encrypt)
  placme updatereg --agreement=...
  placme authz --http=send --domain=<domain> --wait=30
      --keyauth-dir=/www/<domain>/.well-known/acme-challenge
- placme cert --key=<tls.key> <domain>...
+ placme cert (--key=<tls.key>|c--csr=<tls.csr>) <domain>...
 
 =head1 OPTIONS
 
@@ -1388,13 +1388,14 @@ unhelpful things are likely to happen.
 
 =item B<--key=..., -k ...>
 
-Location of a private key to use as basis for the CSR, in PEM format. If you
-do not use this, use C<--csr=...> instead; see below.
+Location of a private key to use as basis for the CSR, in DER or PEM format.
+If you do not use this, use C<--csr=...> instead; see below.
 
 =item B<--csr=..., -c ...>
 
-Use this to pass a pre-generated CSR file (in PEM format) that will be sent to
-the ACME server. If you do not use this, use C<--key=...> instead; see above.
+Use this to pass a pre-generated CSR file (in DER or PEM format) that will be
+sent to the ACME server. If you do not use this, use C<--key=...> instead; see
+above.
 
 =item B<--out=..., -o ...>
 
