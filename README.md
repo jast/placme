@@ -1,5 +1,7 @@
 # placme - a Perl client for the ACME protocol
 
+**placme is no longer maintained due to the abundance of other clients that have come into being. I use https://github.com/srvrco/getssl now in case you wanted a recommendation.**
+
 The ACME protocol powers services that automate SSL/TLS certificate
 generation, notably [Let's Encrypt](https://letsencrypt.org/).
 This is a Perl-based client for it that handles account registration,
